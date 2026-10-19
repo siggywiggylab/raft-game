@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Raft Blocks</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#87ceeb;font-family:system-ui,sans-serif}
+  canvas{display:block}
+  #hud{position:fixed;top:10px;left:10px;color:#fff;text-shadow:0 1px 3px #000;font-size:15px;line-height:1.5;pointer-events:none}
+  #cross{position:fixed;left:50%;top:50%;width:6px;height:6px;margin:-3px;background:#fff;border:1px solid #000;pointer-events:none}
+  #msg{position:fixed;bottom:20px;width:100%;text-align:center;color:#fff;text-shadow:0 1px 3px #000;pointer-events:none}
+  #start{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:rgba(0,0,0,.6);color:#fff;cursor:pointer;text-align:center}
+  #start h1{font-size:44px;margin:0 0 12px}
+  .screen{position:fixed;inset:0;display:none;flex-direction:column;align-items:center;justify-content:center;background:linear-gradient(#5aa9e6,#1d5fa8);color:#fff;gap:12px;text-align:center;z-index:5}
+  .screen h1{font-size:48px;margin:0;text-shadow:0 3px 0 #0006}
+  .screen input{padding:10px 14px;font-size:18px;border-radius:6px;border:0;text-align:center;width:220px}
+  .screen button,#leave{padding:10px 20px;font-size:17px;border-radius:6px;border:0;background:#f5b041;color:#222;cursor:pointer;font-weight:600}
+  .screen button:disabled{opacity:.45;cursor:default}
+  .row{display:flex;gap:10px;align-items:center;justify-content:center}
+  #rooms{min-height:60px;min-width:300px;background:#0003;border-radius:8px;padding:8px}
+  #rooms div{display:flex;justify-content:space-between;gap:16px;align-items:center;padding:4px 0}
+  #err{color:#ffd0d0;min-height:22px;font-weight:600}
+  #code{font-size:56px;letter-spacing:10px;font-weight:700;background:#0004;padding:6px 24px;border-radius:8px}
+  .pl{font-size:20px}
+</style>
+</head>
+<body>
+<div id="hud"></div><div id="cross"></div><div id="msg"></div>
+<div id="start" style="display:none"><h1>Raft Blocks</h1>
+  <div>Click to play<br><br>WASD move · Mouse look · Click collect debris<br>E build raft tile (2 wood) · F eat/drink supplies</div>
+  <button id="leave" style="margin-top:20px">Leave room</button></div>
+<div id="menu" class="screen" style="display:flex"><h1>Raft Blocks</h1>
+  <div>2-player raft survival</div>
+  <input id="name" placeholder="Your name" maxlength="14">
+  <div class="row"><button id="create">Create room</button><label><input type="checkbox" id="pub" checked style="width:auto"> public</label></div>
+  <div class="row"><input id="joincode" placeholder="CODE" maxlength="4" style="width:100px;text-transform:uppercase"><button id="join">Join</button></div>
+  <div id="err"></div>
+  <div>Open rooms</div><div id="rooms">No open rooms</div></div>
+<div id="lobby" class="screen"><div>Room code</div><div id="code">----</div>
+  <div>Share this code with your friend</div>
+  <div id="plist"></div><div id="lstatus"></div>
+  <div class="row"><button id="startbtn">Start game</button><button id="lleave">Leave</button></div></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+const $ = (s) => document.querySelector(s);
+const TILE = 2, TOP = 0.3, EYE = 1.6;
+
+// ---------- scene ----------
+const renderer = new THREE.WebGLRenderer({ antialias: false });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x87ceeb);
+scene.fog = new THREE.Fog(0x87ceeb, 30, 120);
+const camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 0.1, 300);
+camera.rotation.order = 'YXZ';
+scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+const sun = new THREE.DirectionalLight(0xffffff, 0.6); sun.position.set(30, 50, 20); scene.add(sun);
+addEventListener('resize', () => { renderer.setSize(innerWidth, innerHeight); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); });
+
+function blockTex(base, vary, grid) {
+  const c = document.createElement('canvas'); c.width = c.height = 16;
+  const g = c.getContext('2d');
+  for (let y = 0; y < 16; y++) for (let x = 0; x < 16; x++) {
+    const v = (Math.random() - 0.5) * vary;
+    g.fillStyle = `rgb(${base[0] + v},${base[1] + v},${base[2] + v})`; g.fillRect(x, y, 1, 1);
+  }
+  if (grid) { g.fillStyle = 'rgba(0,0,0,.35)'; for (let i = 0; i < 16; i += 4) g.fillRect(0, i, 16, 1); g.fillRect(0, 0, 1, 16); }
+  const t = new THREE.CanvasTexture(c); t.magFilter = THREE.NearestFilter; return t;
+}
+const plankMat = new THREE.MeshLambertMaterial({ map: blockTex([150, 105, 60], 30, true) });
+const tileGeo = new THREE.BoxGeometry(TILE, 0.4, TILE);
+
+// water
+const water = new THREE.Mesh(new THREE.PlaneGeometry(400, 400, 60, 60), new THREE.MeshLambertMaterial({ color: 0x2a7fd4, transparent: true, opacity: 0.85, flatShading: true }));
+water.rotation.x = -Math.PI / 2; scene.add(water);
+const wpos = water.geometry.attributes.position;
+
+// ---------- world state ----------
+const tiles = new Map();
+function addTile(i, j) {
+  const k = i + ',' + j; if (tiles.has(k)) return;
+  const m = new THREE.Mesh(tileGeo, plankMat); m.position.set(i * TILE, TOP - 0.2, j * TILE);
+  scene.add(m); tiles.set(k, m);
+}
+const hasTile = (x, z) => tiles.has(Math.round(x / TILE) + ',' + Math.round(z / TILE));
+
+const debrisMeshes = new Map(), debrisTarget = new Map();
+const dMat = {
+  wood: new THREE.MeshLambertMaterial({ map: blockTex([170, 120, 70], 40, true) }),
+  plastic: new THREE.MeshLambertMaterial({ color: 0xe8f4ff }),
+  barrel: new THREE.MeshLambertMaterial({ color: 0xc0392b }),
+};
+function makeDebris(type) {
+  const s = type === 'barrel' ? 0.9 : type === 'wood' ? 1.2 : 0.7;
+  return new THREE.Mesh(new THREE.BoxGeometry(s, type === 'wood' ? 0.2 : s * 0.8, type === 'wood' ? 0.5 : s), dMat[type]);
+}
+
+const others = new Map();
+const bodyMat = new THREE.MeshLambertMaterial({ color: 0xe67e22 }), headMat = new THREE.MeshLambertMaterial({ color: 0xf1c27d });
+function makeOther(name) {
+  const g = new THREE.Group();
+  const b = new THREE.Mesh(new THREE.BoxGeometry(0.6, 1, 0.4), bodyMat); b.position.y = 0.5;
+  const h = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.5, 0.5), headMat); h.position.y = 1.25;
+  const c = document.createElement('canvas'); c.width = 256; c.height = 64; const x = c.getContext('2d');
+  x.font = 'bold 34px sans-serif'; x.textAlign = 'center'; x.lineWidth = 6; x.strokeStyle = '#000'; x.fillStyle = '#fff';
+  x.strokeText(name, 128, 44); x.fillText(name, 128, 44);
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(c), depthTest: false }));
+  sp.scale.set(2, 0.5, 1); sp.position.y = 1.9; sp.renderOrder = 10;
+  g.add(b, h, sp); scene.add(g); return g;
+}
+
+// ---------- player ----------
+const me = { x: 0, z: 0, yaw: 0, pitch: 0, id: null };
+const inv = { wood: 0, plastic: 0, supplies: 0, hunger: 100, thirst: 100, health: 100 };
+const keys = {};
+let locked = false, toast = '', toastT = 0;
+const say = (t) => { toast = t; toastT = 3; };
+
+$('#start').addEventListener('click', () => renderer.domElement.requestPointerLock());
+$('#leave').addEventListener('click', (e) => { e.stopPropagation(); ws.send(JSON.stringify({ t: 'leave' })); setScreen('menu'); });
+document.addEventListener('pointerlockchange', () => {
+  locked = document.pointerLockElement === renderer.domElement;
+  $('#start').style.display = (locked || screen !== 'game') ? 'none' : 'flex';
+});
+addEventListener('mousemove', (e) => {
+  if (!locked) return;
+  me.yaw -= e.movementX * 0.0022;
+  me.pitch = Math.max(-1.5, Math.min(1.5, me.pitch - e.movementY * 0.0022));
+});
+addEventListener('keydown', (e) => {
+  keys[e.code] = true;
+  if (!locked) return;
+  if (e.code === 'KeyE') placeTile();
+  if (e.code === 'KeyF') useSupply();
+});
+addEventListener('keyup', (e) => (keys[e.code] = false));
+
+const ray = new THREE.Raycaster(); ray.far = 8;
+addEventListener('mousedown', () => {
+  if (!locked) return;
+  ray.setFromCamera({ x: 0, y: 0 }, camera);
+  const hits = ray.intersectObjects([...debrisMeshes.values()]);
+  if (hits.length) {
+    for (const [id, m] of debrisMeshes) if (m === hits[0].object) tx({ t: 'collect', id });
+  }
+});
+
+function placeTile() {
+  if (inv.wood < 2) return say('Need 2 wood');
+  const fx = -Math.sin(me.yaw), fz = -Math.cos(me.yaw);
+  let ci = Math.round(me.x / TILE), cj = Math.round(me.z / TILE);
+  if (Math.abs(fx) > Math.abs(fz)) ci += Math.sign(fx); else cj += Math.sign(fz);
+  if (tiles.has(ci + ',' + cj)) return say('Already a tile there');
+  inv.wood -= 2; tx({ t: 'place', i: ci, j: cj });
+}
+function useSupply() {
+  if (inv.supplies < 1) return say('No supplies');
+  inv.supplies--; inv.hunger = Math.min(100, inv.hunger + 35); inv.thirst = Math.min(100, inv.thirst + 35);
+}
+setInterval(() => {
+  inv.hunger = Math.max(0, inv.hunger - 1); inv.thirst = Math.max(0, inv.thirst - 1.5);
+  if (inv.hunger <= 0 || inv.thirst <= 0) inv.health -= 5; else inv.health = Math.min(100, inv.health + 1);
+  if (inv.health <= 0) { inv.hunger = inv.thirst = inv.health = 100; inv.wood = inv.plastic = inv.supplies = 0; say('You starved! Resources lost.'); }
+}, 3000);
+
+// ---------- network / menus ----------
+let screen = 'menu', roomCode = '', roomPlayers = {}, isHost = false, myName = '';
+const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host);
+const tx = (o) => ws.readyState === 1 && ws.send(JSON.stringify(o));
+function setScreen(s) {
+  screen = s;
+  $('#menu').style.display = s === 'menu' ? 'flex' : 'none';
+  $('#lobby').style.display = s === 'lobby' ? 'flex' : 'none';
+  $('#hud').style.display = $('#cross').style.display = s === 'game' ? 'block' : 'none';
+  if (s !== 'game') { document.exitPointerLock && document.exitPointerLock(); $('#start').style.display = 'none'; }
+  if (s === 'menu') { roomCode = ''; roomPlayers = {}; }
+}
+function resetWorld() {
+  tiles.forEach((m) => scene.remove(m)); tiles.clear();
+  debrisMeshes.forEach((m) => scene.remove(m)); debrisMeshes.clear(); debrisTarget.clear();
+  others.forEach((o) => scene.remove(o.mesh)); others.clear();
+  Object.assign(inv, { wood: 0, plastic: 0, supplies: 0, hunger: 100, thirst: 100, health: 100 });
+  me.x = me.z = me.yaw = me.pitch = 0;
+}
+try { $('#name').value = localStorage.getItem('raftName') || ''; } catch (e) {}
+const getName = () => { const n = $('#name').value.trim() || 'Player'; try { localStorage.setItem('raftName', n); } catch (e) {} return n; };
+$('#create').onclick = () => { $('#err').textContent = ''; tx({ t: 'create', name: getName(), pub: $('#pub').checked }); };
+const doJoin = (code) => { $('#err').textContent = ''; tx({ t: 'join', name: getName(), code }); };
+$('#join').onclick = () => doJoin($('#joincode').value);
+$('#joincode').addEventListener('keydown', (e) => { if (e.key === 'Enter') doJoin($('#joincode').value); });
+$('#startbtn').onclick = () => tx({ t: 'start' });
+$('#lleave').onclick = () => { tx({ t: 'leave' }); setScreen('menu'); };
+setInterval(() => { if (screen === 'menu') tx({ t: 'list' }); }, 3000);
+ws.onopen = () => tx({ t: 'list' });
+
+function renderLobby(m) {
+  $('#code').textContent = m.code;
+  $('#plist').innerHTML = m.players.map((p) => `<div class="pl">${p.id === m.host ? '👑 ' : ''}${esc(p.name)}</div>`).join('');
+  isHost = m.host === me.id || (me.id == null && m.players.length === 1);
+  const full = m.players.length >= 2;
+  $('#startbtn').style.display = isHost ? 'inline-block' : 'none';
+  $('#startbtn').disabled = !full;
+  $('#lstatus').textContent = !full ? 'Waiting for a second player…' : isHost ? 'Ready to go!' : 'Waiting for the host to start…';
+}
+const esc = (t) => t.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+ws.onmessage = (ev) => {
+  const m = JSON.parse(ev.data);
+  if (m.t === 'rooms') {
+    $('#rooms').innerHTML = m.rooms.length ? m.rooms.map((r) => `<div><span>${esc(r.host || '?')}'s room (${r.count}/2)</span><button data-c="${r.code}">Join</button></div>`).join('') : 'No open rooms';
+    $('#rooms').querySelectorAll('button').forEach((b) => (b.onclick = () => doJoin(b.dataset.c)));
+  } else if (m.t === 'err') { $('#err').textContent = m.msg; say(m.msg); }
+  else if (m.t === 'room') {
+    const had = Object.keys(roomPlayers).length;
+    roomCode = m.code; if (m.you) me.id = m.you; roomPlayers = {}; m.players.forEach((p) => (roomPlayers[p.id] = p.name));
+    if (screen === 'menu') setScreen('lobby');
+    if (screen === 'lobby') renderLobby(m);
+    if (screen === 'game' && m.players.length < had) say('Your partner left the room');
+    if (screen === 'game' && m.players.length > had) say('Your partner joined');
+  } else if (m.t === 'init') {
+    resetWorld(); me.id = m.id; m.tiles.forEach(([i, j]) => addTile(i, j));
+    setScreen('game'); $('#start').style.display = 'flex';
+  } else if (m.t === 'tile') addTile(m.i, m.j);
+  else if (m.t === 'got') {
+    if (m.type === 'wood') inv.wood++; else if (m.type === 'plastic') inv.plastic++; else inv.supplies++;
+    say('Collected ' + m.type);
+  } else if (m.t === 'state') {
+    const seen = new Set();
+    for (const [id, type, x, z] of m.debris) {
+      seen.add(id);
+      if (!debrisMeshes.has(id)) { const d = makeDebris(type); d.position.set(x, 0.2, z); scene.add(d); debrisMeshes.set(id, d); }
+      debrisTarget.set(id, [x, z]);
+    }
+    for (const [id, d] of debrisMeshes) if (!seen.has(id)) { scene.remove(d); debrisMeshes.delete(id); debrisTarget.delete(id); }
+    const ps = new Set();
+    for (const [id, x, z, yaw] of m.players) {
+      if (id === me.id) continue; ps.add(id);
+      if (!others.has(id)) others.set(id, { mesh: makeOther(roomPlayers[id] || 'Player'), x, z });
+      const o = others.get(id); o.x = x; o.z = z; o.mesh.rotation.y = yaw;
+    }
+    for (const [id, o] of others) if (!ps.has(id)) { scene.remove(o.mesh); others.delete(id); }
+  }
+};
+setInterval(() => { if (screen === 'game') tx({ t: 'pos', x: me.x, z: me.z, yaw: me.yaw }); }, 66);
+ws.onclose = () => { $('#err').textContent = 'Disconnected from server — refresh the page'; say('Disconnected from server'); };
+
+// ---------- loop ----------
+let prev = performance.now();
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dt = Math.min(0.05, (now - prev) / 1000); prev = now; const t = now / 1000;
+
+  if (locked && screen === 'game') {
+    const f = (keys.KeyW ? 1 : 0) - (keys.KeyS ? 1 : 0), s = (keys.KeyD ? 1 : 0) - (keys.KeyA ? 1 : 0);
+    const sp = 4 * dt;
+    const dx = (-Math.sin(me.yaw) * f + Math.cos(me.yaw) * s) * sp, dz = (-Math.cos(me.yaw) * f - Math.sin(me.yaw) * s) * sp;
+    if (hasTile(me.x + dx + Math.sign(dx) * 0.2, me.z)) me.x += dx;
+    if (hasTile(me.x, me.z + dz + Math.sign(dz) * 0.2)) me.z += dz;
+  }
+
+  // waves
+  for (let i = 0; i < wpos.count; i++) {
+    const x = wpos.getX(i), y = wpos.getY(i);
+    wpos.setZ(i, Math.sin(x * 0.15 + t) * 0.08 + Math.cos(y * 0.12 + t * 0.8) * 0.08);
+  }
+  wpos.needsUpdate = true;
+
+  const bob = Math.sin(t * 1.2) * 0.03;
+  camera.position.set(me.x, TOP + EYE + bob, me.z);
+  camera.rotation.set(me.pitch, me.yaw, 0);
+
+  for (const [id, d] of debrisMeshes) {
+    const tg = debrisTarget.get(id); if (!tg) continue;
+    d.position.x += (tg[0] - d.position.x) * 0.2; d.position.z += (tg[1] - d.position.z) * 0.2;
+    d.position.y = 0.15 + Math.sin(t * 2 + id) * 0.06; d.rotation.y += dt * 0.3;
+  }
+  for (const o of others.values()) { o.mesh.position.x += (o.x - o.mesh.position.x) * 0.3; o.mesh.position.z += (o.z - o.mesh.position.z) * 0.3; o.mesh.position.y = TOP; }
+
+  toastT -= dt; $('#msg').textContent = toastT > 0 ? toast : '';
+  $('#hud').innerHTML = `Health ${Math.round(inv.health)} · Hunger ${Math.round(inv.hunger)} · Thirst ${Math.round(inv.thirst)}<br>Wood ${inv.wood} · Plastic ${inv.plastic} · Supplies ${inv.supplies}<br>Room ${roomCode} · ${Object.values(roomPlayers).join(' & ')}`;
+  renderer.render(scene, camera);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
